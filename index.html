@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <title>blkviz</title>
+    <style>
+        body {
+            /* overflow: hidden; */
+        }
+
+        .content {
+            display: grid;
+        }
+
+        .timeline {
+            width: 1000px;
+            height: 50px;
+            border: 1px solid black;
+            margin: 5px;
+        }
+
+        .options {
+            margin: 5px;
+        }
+
+        .blocks {
+            width: 1024px;
+            height: 1024px;
+            border: 1px solid black;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="content">
+        <div class="timeline">
+            <canvas width="1000" height="50" id="timeline-canvas">
+            </canvas>
+        </div>
+        <div class="options">
+            <span>Log file: </span><input id="input-logfile" size="20" value="nvme0n1.blktrace.0.log"/>
+            <span>Start: </span><input id="input-starttime" size="1" value="0.0"/>
+            <span>Timespan: </span><input id="input-timespan" size="1" value="10.0"/>
+            <span>Zoom: </span><input id="input-zoom" size="1" value="4"/>
+            <span>Info: </span><input id="input-info" readonly size="60"/>
+        </div>
+        <div class="blocks">
+            <canvas width="1024" height="1024" id="bioviz">
+            </canvas>
+        </div>
+    </div>
+</body>
+
+<script>
+    var block_pixels;
+    var width;
+    var height;
+
+    let first_ts = 0;
+    let last_ts = 0;
+
+    let first_block = 0;
+    let last_block = 0;
+    let block_size = 512;
+
+    let ts = 0;
+
+    let log_text = "";
+    let events = [];
+
+    var canvas = document.getElementById("bioviz");
+    var ctx = canvas.getContext("2d");
+
+    function erase() {
+        block_pixels = +document.getElementById('input-zoom').value;
+        width = 1024 / block_pixels;
+        height = 1024;
+
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+    erase();
+
+    function load() {
+        fetch(document.getElementById('input-logfile').value)
+        .then(function (response) {
+            return response.text();
+        })
+        .then(function (text) {
+            log_text = text;
+            parse();
+        });
+    }
+    load();
+
+    function parse() {
+        events = [];
+
+        let start_time = +document.getElementById('input-starttime').value;
+        let end_time = start_time + +document.getElementById('input-timespan').value;
+
+        lines = log_text.split('\n');
+        for (let line of lines) {
+            let cols = line.split(/\s+/);
+            if (cols.length < 7)
+                continue;
+            let ts = +cols[3];
+            if (ts < start_time || ts > end_time)
+                continue;
+            if (['A', 'Q', 'G', 'I', 'D'].indexOf(cols[5]) == -1)
+                continue;
+            let event = {
+                'dev': cols[0],
+                'cpu': cols[1],
+                'seq': cols[2],
+                'ts': ts,
+                'pid': cols[4],
+                'action': cols[5],
+                'rwbs': cols[6],
+                'block': +cols[7],
+                'extra': cols.slice(8, cols.length),
+                'line': line
+            };
+            events.push(event);
+        }
+
+        process();
+        paint(0, ts);
+    }
+
+    function process() {
+        first_block = 10000000;
+        first_ts = 10000000;
+        last_block = 0;
+        last_ts = 0;
+        for (let e of events) {
+            if (['A', 'Q', 'G', 'I', 'D'].indexOf(e.action) >= 0) {
+                if (e.block % block_size)
+                    console.log("misaligned block", e.block);
+                if (e.block < first_block) first_block = e.block;
+                if (e.block > last_block) last_block = e.block;
+                let event_ts = +e.ts;
+                if (event_ts < first_ts) first_ts = event_ts;
+                if (event_ts > last_ts) last_ts = event_ts;
+            }
+        }
+        ts = last_ts;
+        ybuckets = [];
+        for (let e of events) {
+            let relblock = (e.block - first_block) / block_size;
+            let y = Math.trunc(relblock / width);
+            if (y in ybuckets) {
+                bucket = ybuckets[y];
+                bucket.first_ts = Math.min(ybuckets[y].first_ts, e.ts);
+                bucket.last_ts = Math.max(ybuckets[y].last_ts, e.ts);
+                bucket.events.push(e);
+            } else {
+                ybuckets[y] = { y: y, first_ts: e.ts, last_ts: e.ts, events: [e] };
+            }
+        }
+        console.log("ranges: ", events.length, first_block, last_block, first_ts, last_ts)
+    }
+
+    function paint_block(block, action) {
+        let relblock = (block - first_block) / block_size;
+        let x = relblock % width;
+        let y = Math.trunc(relblock / width);
+        switch (action) {
+            case 'A': ctx.fillStyle = "#303078"; break;
+            case 'Q': ctx.fillStyle = "#307878"; break;
+            case 'G': ctx.fillStyle = "#783078"; break;
+            case 'I': ctx.fillStyle = "#787878"; break;
+            case 'D': ctx.fillStyle = "#303030"; break;
+            default:  ctx.fillStyle = "#783030"; break;
+        }
+        ctx.fillRect(x * block_pixels, y * block_pixels, block_pixels, block_pixels);
+    }
+
+    var timelineCanvas = document.getElementById("timeline-canvas");
+    var timelineCtx = timelineCanvas.getContext("2d");
+
+    function paint(old_ts, new_ts) {
+        let min_ts = Math.min(old_ts, new_ts);
+        let max_ts = Math.max(old_ts, new_ts);
+        let final_e = null;
+        for (let b in ybuckets) {
+            let bucket = ybuckets[b];
+            let mx = Math.max(bucket.first_ts, min_ts);
+            let mn = Math.min(bucket.last_ts, max_ts);
+            if (mn < mx)
+                continue;
+            ctx.fillStyle = "#ffffff";
+            ctx.fillRect(0, bucket.y * block_pixels, canvas.width, block_pixels);
+            for (let e of bucket.events) {
+                if (e.ts < new_ts) {
+                    if (final_e == null || e.ts > final_e.ts) {
+                        final_e = e;
+                    }
+                    paint_block(e.block, e.action);
+                }
+            }
+        }
+
+        timelineCtx.fillStyle = "#ffffff";
+        timelineCtx.fillRect(0, 0, timelineCanvas.width, timelineCanvas.height);
+        timelineCtx.fillStyle = "#000000";
+        timelineCtx.fillRect((new_ts - first_ts) / (last_ts - first_ts) * timelineCanvas.width, 0, 1, timelineCanvas.height);
+
+        if (final_e != null) {
+            document.getElementById("input-info").value = final_e.line;
+        }
+    }
+
+    let timelineDrag = false;
+    function timelineMouse(ev) {
+        ev.preventDefault();
+
+        let rect = timelineCanvas.getBoundingClientRect();
+        let canvasX = ev.clientX - rect.left;
+        let canvasY = ev.clientY - rect.top;
+
+        let old_ts = ts;
+        ts = first_ts + (last_ts - first_ts) * (canvasX / timelineCanvas.width);
+
+        paint(old_ts, ts);
+    }
+    timelineCanvas.addEventListener('mousedown', function (ev) {
+        timelineDrag = true;
+        timelineMouse(ev);
+    });
+    timelineCanvas.addEventListener('mouseup', function (ev) {
+        timelineDrag = false;
+    });
+    timelineCanvas.addEventListener('mousemove', function (ev) {
+        if (timelineDrag) {
+            timelineMouse(ev);
+        }
+    });
+
+    document.getElementById('input-logfile').addEventListener('keydown', function (ev) {
+        if (ev.keyCode == 13) {
+            erase();
+            load();
+        }
+    });
+    document.getElementById('input-starttime').addEventListener('keydown', function (ev) {
+        if (ev.keyCode == 13) {
+            erase();
+            parse();
+        }
+    });
+    document.getElementById('input-timespan').addEventListener('keydown', function (ev) {
+        if (ev.keyCode == 13) {
+            erase();
+            parse();
+        }
+    });
+    document.getElementById('input-zoom').addEventListener('keydown', function (ev) {
+        if (ev.keyCode == 13) {
+            erase();
+            parse();
+        }
+    });
+</script>
+
+</html>
